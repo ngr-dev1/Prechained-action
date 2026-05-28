@@ -1,5 +1,5 @@
 name: 'Prechained Supply Chain Verify'
-description: 'Verify your dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
+description: 'Verify dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
 author: 'NextGenRails™'
 
 branding:
