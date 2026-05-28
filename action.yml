@@ -1,0 +1,37 @@
+name: 'Prechained Supply Chain Verify'
+description: 'Verify your dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
+author: 'NextGenRails™'
+
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  ecosystem:
+    description: 'Package ecosystem to verify (npm, pypi, cargo)'
+    required: false
+    default: 'npm'
+  manifest:
+    description: 'Path to manifest file (package.json, requirements.txt, Cargo.toml)'
+    required: false
+    default: ''
+  fail-on-missing:
+    description: 'Fail the build if packages are not in the Prechained archive'
+    required: false
+    default: 'false'
+  api-url:
+    description: 'Prechained API base URL'
+    required: false
+    default: 'https://prechained.com/.netlify/functions/api'
+
+outputs:
+  verified-count:
+    description: 'Number of packages verified in the archive'
+  missing-count:
+    description: 'Number of packages not yet in the archive'
+  report:
+    description: 'JSON report of verification results'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
