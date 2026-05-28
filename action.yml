@@ -1,5 +1,5 @@
 name: 'Prechained Supply Chain Verify'
-description: 'Verify dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
+description: 'Verify your dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
 author: 'NextGenRails™'
 
 branding:
@@ -33,5 +33,5 @@ outputs:
     description: 'JSON report of verification results'
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
