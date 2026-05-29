@@ -28,17 +28,29 @@ function log(m)  { console.log(`[Prechained] ${m}`); }
 function warn(m) { console.log(`⚠️  [Prechained] ${m}`); }
 function error(m){ console.error(`❌ [Prechained] ${m}`); }
 
-function fetchJSON(url) {
+function fetchJSONOnce(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'prechained-action' } }, (res) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'prechained-action' }, timeout: 10000 }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
         try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
         catch (e) { reject(new Error('Invalid JSON from ' + url)); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Request timed out: ' + url)); });
   });
+}
+
+// One retry on transient failure (timeout, dropped connection, bad JSON).
+// A single network blip should not silently bucket a package as "error".
+async function fetchJSON(url) {
+  try { return await fetchJSONOnce(url); }
+  catch (e) {
+    await new Promise(r => setTimeout(r, 500));
+    return await fetchJSONOnce(url);
+  }
 }
 
 // -- Lockfile parsing -------------------------------------------
@@ -231,11 +243,22 @@ async function run() {
     if (results.missing.length > 10) console.log(`   ... and ${results.missing.length - 10} more`);
   }
 
+  // Honest coverage signal: a green check means little if most of the tree
+  // could not actually be checked. Surface that explicitly so "passed" is not
+  // mistaken for "verified clean".
+  const checkable = results.verified.length + results.mismatch.length;
+  const pct = packages.length ? Math.round((checkable / packages.length) * 100) : 0;
+  console.log(`\nℹ️  Coverage: ${checkable}/${packages.length} (${pct}%) of resolved packages had an anchored hash to compare against.`);
+  if (pct < 50) {
+    console.log(`   Most dependencies are not yet in the archive, so this run verified little. A pass here does NOT mean "verified clean".`);
+  }
+
   console.log(`\n🔗 Archive: https://prechained.com/browse`);
 
   setOutput('verified-count', String(results.verified.length));
   setOutput('missing-count', String(results.missing.length));
   setOutput('mismatch-count', String(results.mismatch.length));
+  setOutput('coverage-percent', String(pct));
   setOutput('report', JSON.stringify(results));
 
   if (failOnMismatch && results.mismatch.length > 0) {
