@@ -1,159 +1,252 @@
 // Prechained Supply Chain Verify — GitHub Action
 // https://prechained.com · Built by NextGenRails™
+//
+// What this does:
+//   Reads the EXACT artifact hashes your package manager resolved (from the
+//   lockfile), and compares them against the hashes Prechained recorded and
+//   Bitcoin-anchored. If a hash differs, the published artifact changed AFTER
+//   Prechained's anchored capture — i.e. tamper — and the build fails.
+//
+// Why the lockfile:
+//   package-lock.json (npm) stores `integrity` (SRI sha512) for every resolved
+//   package. That is the hash npm itself verifies on install — the bytes that
+//   will actually land in your environment. Prechained records the same field
+//   at capture time. Comparing them is a true, reproducible tamper check, not a
+//   re-hash of metadata. Bitcoin anchoring makes the recorded side unforgeable.
 
 const fs = require('fs');
-const path = require('path');
 const https = require('https');
 
-// Simple input getter (works without @actions/core for zero-dependency)
 function getInput(name) {
   return process.env[`INPUT_${name.toUpperCase().replace(/-/g, '_')}`] || '';
 }
-
 function setOutput(name, value) {
-  const outputFile = process.env.GITHUB_OUTPUT;
-  if (outputFile) fs.appendFileSync(outputFile, `${name}=${value}\n`);
+  const f = process.env.GITHUB_OUTPUT;
+  if (f) fs.appendFileSync(f, `${name}=${value}\n`);
 }
+function log(m)  { console.log(`[Prechained] ${m}`); }
+function warn(m) { console.log(`⚠️  [Prechained] ${m}`); }
+function error(m){ console.error(`❌ [Prechained] ${m}`); }
 
-function log(msg) { console.log(`[Prechained] ${msg}`); }
-function warn(msg) { console.log(`⚠️  [Prechained] ${msg}`); }
-function error(msg) { console.error(`❌ [Prechained] ${msg}`); }
-
-async function fetchJSON(url) {
+function fetchJSON(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
+    https.get(url, { headers: { 'User-Agent': 'prechained-action' } }, (res) => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Invalid JSON response')); }
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch (e) { reject(new Error('Invalid JSON from ' + url)); }
       });
     }).on('error', reject);
   });
 }
 
-function parseNpm(manifestPath) {
-  const file = manifestPath || 'package.json';
-  if (!fs.existsSync(file)) return [];
-  const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  return Object.keys(deps).map(name => ({ name, version: deps[name].replace(/[\^~>=<]/g, '').split(' ')[0] }));
-}
+// -- Lockfile parsing -------------------------------------------
+// Returns [{ name, version, integrity, shasum }] for what will ACTUALLY install.
 
-function parsePypi(manifestPath) {
-  const file = manifestPath || 'requirements.txt';
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8')
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => l && !l.startsWith('#'))
-    .map(l => {
-      const [name, version] = l.split(/[==>=<]/);
-      return { name: name.trim(), version: (version || '').trim() };
-    });
-}
+function parseNpmLock(lockPath) {
+  if (!fs.existsSync(lockPath)) return null;
+  const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  const out = [];
 
-function parseCargo(manifestPath) {
-  const file = manifestPath || 'Cargo.toml';
-  if (!fs.existsSync(file)) return [];
-  const content = fs.readFileSync(file, 'utf8');
-  const deps = [];
-  const depSection = content.match(/\[dependencies\]([\s\S]*?)(?=\[|$)/);
-  if (!depSection) return [];
-  const lines = depSection[1].split('\n').filter(l => l.trim() && !l.startsWith('#'));
-  for (const line of lines) {
-    const match = line.match(/^(\S+)\s*=\s*"([^"]+)"/);
-    if (match) deps.push({ name: match[1], version: match[2] });
+  // npm v7+ lockfileVersion 2/3: "packages" keyed by "node_modules/<name>"
+  if (lock.packages) {
+    for (const [key, val] of Object.entries(lock.packages)) {
+      if (!key.startsWith('node_modules/')) continue; // skip root ("")
+      const name = key.replace(/^.*node_modules\//, '');
+      if (!val.version) continue;
+      out.push({
+        name,
+        version: val.version,
+        integrity: val.integrity || null,
+        shasum: null, // not present in v2/3 packages block
+      });
+    }
+    if (out.length) return out;
   }
-  return deps;
+
+  // npm v6 lockfileVersion 1: "dependencies" tree
+  if (lock.dependencies) {
+    const walk = (deps) => {
+      for (const [name, val] of Object.entries(deps)) {
+        if (val.version) {
+          out.push({
+            name,
+            version: val.version,
+            integrity: val.integrity || null,
+            shasum: null,
+          });
+        }
+        if (val.dependencies) walk(val.dependencies);
+      }
+    };
+    walk(lock.dependencies);
+  }
+  return out.length ? out : null;
 }
 
-async function verifyPackage(apiUrl, ecosystem, name, version) {
-  try {
-    const url = `${apiUrl}?action=fingerprint&package=${encodeURIComponent(name)}&ecosystem=${ecosystem}${version ? `&version=${encodeURIComponent(version)}` : ''}`;
-    const data = await fetchJSON(url);
-    return data;
-  } catch(e) {
-    return { found: false, error: e.message };
+function detectNpmLock(manifestInput) {
+  if (manifestInput && fs.existsSync(manifestInput)) return manifestInput;
+  if (fs.existsSync('package-lock.json')) return 'package-lock.json';
+  if (fs.existsSync('npm-shrinkwrap.json')) return 'npm-shrinkwrap.json';
+  return null;
+}
+
+// -- Verify one package against Prechained ----------------------
+// Compares the lockfile's integrity to Prechained's recorded artifact_integrity.
+
+async function verifyPackage(apiUrl, ecosystem, pkg) {
+  const url = `${apiUrl}?action=fingerprint&package=${encodeURIComponent(pkg.name)}` +
+              `&ecosystem=${ecosystem}&version=${encodeURIComponent(pkg.version)}`;
+  let resp;
+  try { resp = await fetchJSON(url); }
+  catch (e) { return { name: pkg.name, version: pkg.version, status: 'error', detail: e.message }; }
+
+  const rec = resp.body;
+
+  if (!rec || rec.found === false) {
+    return { name: pkg.name, version: pkg.version, status: 'missing' };
   }
+
+  // No recorded artifact hash to compare against -> can't assert tamper either way.
+  if (!rec.artifact_integrity && !rec.artifact_shasum) {
+    return {
+      name: pkg.name, version: pkg.version, status: 'unverifiable',
+      receipt_id: rec.receipt_id, btc_block: rec.btc_block,
+      detail: 'recorded before artifact hash was exposed',
+    };
+  }
+
+  // Primary comparison: SRI integrity (sha512). This is what npm verifies.
+  if (pkg.integrity && rec.artifact_integrity) {
+    if (pkg.integrity === rec.artifact_integrity) {
+      return {
+        name: pkg.name, version: pkg.version, status: 'verified',
+        receipt_id: rec.receipt_id, btc_block: rec.btc_block,
+        btc_anchored: rec.btc_anchored,
+      };
+    }
+    return {
+      name: pkg.name, version: pkg.version, status: 'mismatch',
+      receipt_id: rec.receipt_id, btc_block: rec.btc_block,
+      btc_anchored: rec.btc_anchored,
+      recorded: rec.artifact_integrity, observed: pkg.integrity,
+      verify_url: rec.verify_url || null,
+    };
+  }
+
+  // Fallback comparison: shasum (sha1) if integrity absent on either side.
+  if (pkg.shasum && rec.artifact_shasum) {
+    if (pkg.shasum === rec.artifact_shasum) {
+      return { name: pkg.name, version: pkg.version, status: 'verified',
+               receipt_id: rec.receipt_id, btc_block: rec.btc_block };
+    }
+    return { name: pkg.name, version: pkg.version, status: 'mismatch',
+             receipt_id: rec.receipt_id, btc_block: rec.btc_block,
+             recorded: rec.artifact_shasum, observed: pkg.shasum };
+  }
+
+  // Recorded hash exists but lockfile gave us nothing comparable.
+  return {
+    name: pkg.name, version: pkg.version, status: 'unverifiable',
+    receipt_id: rec.receipt_id, btc_block: rec.btc_block,
+    detail: 'no comparable hash in lockfile',
+  };
 }
 
 async function run() {
-  const ecosystem = getInput('ecosystem') || 'npm';
-  const manifestPath = getInput('manifest');
-  const failOnMissing = getInput('fail-on-missing') === 'true';
+  const ecosystem = (getInput('ecosystem') || 'npm').toLowerCase();
+  const manifestInput = getInput('manifest');
+  const failOnMismatch = (getInput('fail-on-mismatch') || 'true') === 'true';
+  const failOnMissing  = (getInput('fail-on-missing')  || 'false') === 'true';
   const apiUrl = getInput('api-url') || 'https://prechained.com/.netlify/functions/api';
 
-  log(`Verifying ${ecosystem} dependencies against Prechained archive...`);
-  log(`API: ${apiUrl}`);
+  log(`Tamper-checking ${ecosystem} dependencies against the Prechained archive`);
 
-  let packages = [];
-  if (ecosystem === 'npm') packages = parseNpm(manifestPath);
-  else if (ecosystem === 'pypi') packages = parsePypi(manifestPath);
-  else if (ecosystem === 'cargo') packages = parseCargo(manifestPath);
-
-  if (packages.length === 0) {
-    warn(`No packages found for ecosystem: ${ecosystem}`);
+  if (ecosystem !== 'npm') {
+    warn(`Tamper detection currently supports npm lockfiles. ` +
+         `Ecosystem "${ecosystem}" will be skipped. (pypi/cargo lockfile support coming.)`);
     setOutput('verified-count', '0');
     setOutput('missing-count', '0');
+    setOutput('mismatch-count', '0');
     return;
   }
 
-  log(`Found ${packages.length} packages to verify`);
+  const lockPath = detectNpmLock(manifestInput);
+  if (!lockPath) {
+    error('No package-lock.json found. A lockfile is required for tamper detection — ' +
+          'it contains the exact artifact hashes that will install. Run `npm install` to generate one.');
+    process.exit(1);
+  }
+  log(`Reading resolved hashes from ${lockPath}`);
 
-  const results = { verified: [], missing: [], errors: [] };
+  const packages = parseNpmLock(lockPath);
+  if (!packages || !packages.length) {
+    warn('No resolved packages found in lockfile.');
+    setOutput('verified-count', '0');
+    setOutput('missing-count', '0');
+    setOutput('mismatch-count', '0');
+    return;
+  }
+  log(`Found ${packages.length} resolved packages to check`);
 
-  // Verify in batches of 5 to avoid rate limits
+  const results = { verified: [], missing: [], mismatch: [], unverifiable: [], errors: [] };
+
   const batchSize = 5;
   for (let i = 0; i < packages.length; i += batchSize) {
     const batch = packages.slice(i, i + batchSize);
-    await Promise.all(batch.map(async (pkg) => {
-      const result = await verifyPackage(apiUrl, ecosystem, pkg.name, pkg.version);
-      if (result.found) {
-        results.verified.push({ ...pkg, receipt_id: result.receipt_id, btc_block: result.btc_block });
-      } else if (result.error) {
-        results.errors.push({ ...pkg, error: result.error });
-      } else {
-        results.missing.push(pkg);
-      }
-    }));
-    // Small delay between batches
+    const settled = await Promise.all(batch.map(p => verifyPackage(apiUrl, ecosystem, p)));
+    for (const r of settled) {
+      if (r.status === 'verified')          results.verified.push(r);
+      else if (r.status === 'missing')      results.missing.push(r);
+      else if (r.status === 'mismatch')     results.mismatch.push(r);
+      else if (r.status === 'unverifiable') results.unverifiable.push(r);
+      else                                  results.errors.push(r);
+    }
     if (i + batchSize < packages.length) await new Promise(r => setTimeout(r, 200));
   }
 
-  // Summary
-  console.log('\n📊 Prechained Verification Summary');
-  console.log('═'.repeat(50));
-  console.log(`✅ Verified in archive:  ${results.verified.length} / ${packages.length}`);
-  console.log(`❌ Not in archive:       ${results.missing.length} / ${packages.length}`);
-  if (results.errors.length) console.log(`⚠️  Errors:               ${results.errors.length} / ${packages.length}`);
+  console.log('\n📊 Prechained Tamper-Detection Summary');
+  console.log('='.repeat(54));
+  console.log(`✅ Verified (hash matches anchor): ${results.verified.length} / ${packages.length}`);
+  console.log(`🚨 MISMATCH (artifact changed):    ${results.mismatch.length} / ${packages.length}`);
+  console.log(`📦 Not yet archived:               ${results.missing.length} / ${packages.length}`);
+  console.log(`➖ Recorded, not yet comparable:   ${results.unverifiable.length} / ${packages.length}`);
+  if (results.errors.length) console.log(`⚠️  Lookup errors:                  ${results.errors.length} / ${packages.length}`);
 
-  if (results.missing.length > 0) {
-    console.log('\n📦 Missing from archive (capture at prechained.com/capture):');
-    results.missing.slice(0, 10).forEach(p => console.log(`   • ${p.name}${p.version ? `@${p.version}` : ''}`));
+  if (results.mismatch.length) {
+    console.log('\n🚨 TAMPER DETECTED — these artifacts differ from the Bitcoin-anchored record:');
+    for (const m of results.mismatch) {
+      console.log(`   • ${m.name}@${m.version}`);
+      console.log(`       recorded: ${m.recorded}`);
+      console.log(`       observed: ${m.observed}`);
+      if (m.btc_block) console.log(`       anchor:   BTC #${Number(m.btc_block).toLocaleString()}`);
+      if (m.verify_url) console.log(`       verify:   ${m.verify_url}`);
+    }
+  }
+
+  if (results.missing.length) {
+    console.log('\n📦 Not in archive yet (capture at prechained.com/capture):');
+    results.missing.slice(0, 10).forEach(p => console.log(`   • ${p.name}@${p.version}`));
     if (results.missing.length > 10) console.log(`   ... and ${results.missing.length - 10} more`);
   }
 
-  if (results.verified.length > 0) {
-    console.log('\n🔐 Sample verified receipts:');
-    results.verified.slice(0, 5).forEach(p => {
-      if (p.receipt_id) console.log(`   • ${p.name} → ${p.receipt_id} (BTC #${p.btc_block || 'pending'})`);
-    });
-  }
-
-  console.log(`\n🔗 Full archive: https://prechained.com/browse`);
+  console.log(`\n🔗 Archive: https://prechained.com/browse`);
 
   setOutput('verified-count', String(results.verified.length));
   setOutput('missing-count', String(results.missing.length));
+  setOutput('mismatch-count', String(results.mismatch.length));
   setOutput('report', JSON.stringify(results));
 
+  if (failOnMismatch && results.mismatch.length > 0) {
+    error(`${results.mismatch.length} package(s) FAILED tamper check — artifact hash does not ` +
+          `match the Bitcoin-anchored Prechained record. Build blocked.`);
+    process.exit(1);
+  }
   if (failOnMissing && results.missing.length > 0) {
-    error(`${results.missing.length} packages not found in Prechained archive. Set fail-on-missing: false to allow.`);
+    error(`${results.missing.length} package(s) not in archive and fail-on-missing is set.`);
     process.exit(1);
   }
 }
 
-run().catch(e => {
-  error(e.message);
-  process.exit(1);
-});
+run().catch(e => { error(e.message); process.exit(1); });
