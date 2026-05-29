@@ -1,19 +1,39 @@
 # Prechained Supply Chain Verify
 
-[![Prechained](https://img.shields.io/badge/archived-prechained.com-orange?style=flat-square)](https://prechained.com)
+[![Prechained](https://img.shields.io/badge/anchored-prechained.com-orange?style=flat-square)](https://prechained.com)
 
-Verify your dependencies against the [Prechained](https://prechained.com) cryptographic archive — a free, public, Bitcoin-anchored record of the software supply chain.
+Detect tampered dependencies in CI by comparing the artifact hashes in your
+lockfile against the **Bitcoin-anchored** record in the
+[Prechained](https://prechained.com) archive. If a published package's bytes
+changed after Prechained recorded and anchored them, this action **fails the
+build** — before the tampered code reaches production.
 
-Every major npm, PyPI, and Cargo package is captured and fingerprinted every 10 minutes. This action checks whether your dependencies have pre-incident records, giving you forensic proof that you were using clean versions before any attack occurred.
+## How it works
+
+1. Reads `package-lock.json` — the exact `integrity` (SRI sha512) hashes npm
+   resolved for every dependency. These are the bytes that will actually install.
+2. For each package version, asks the Prechained API for the artifact hash it
+   recorded at capture time, anchored to a Bitcoin block.
+3. Compares them:
+   - **match** → verified against an immutable, independently checkable anchor
+   - **mismatch** → the artifact changed after the anchor = tamper → build fails
+   - **not in archive** → no record yet (does not fail by default)
+
+The recorded side is anchored to Bitcoin, so neither the registry, nor an
+attacker, nor Prechained itself can silently rewrite history. The observed side
+comes from your own lockfile. Both are reproducible — this is a real check, not
+a re-hash of metadata.
 
 ## Usage
 
 ```yaml
-- name: Verify dependencies with Prechained
+- name: Tamper-check dependencies with Prechained
   uses: ngr-dev1/prechained-action@v1
   with:
     ecosystem: npm
 ```
+
+A `package-lock.json` must exist (run `npm install` first).
 
 ## Full example
 
@@ -27,17 +47,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Verify dependencies with Prechained
+
+      - name: Install (generates/uses lockfile)
+        run: npm ci
+
+      - name: Tamper-check with Prechained
+        id: prechained
         uses: ngr-dev1/prechained-action@v1
         with:
           ecosystem: npm
-          manifest: package.json
-          fail-on-missing: false
-        
-      - name: Print verification report
+          fail-on-mismatch: true
+
+      - name: Report
+        if: always()
         run: |
           echo "Verified: ${{ steps.prechained.outputs.verified-count }}"
+          echo "Mismatch: ${{ steps.prechained.outputs.mismatch-count }}"
           echo "Missing:  ${{ steps.prechained.outputs.missing-count }}"
 ```
 
@@ -45,26 +70,31 @@ jobs:
 
 | Input | Description | Default |
 |-------|-------------|---------|
-| `ecosystem` | Package ecosystem (`npm`, `pypi`, `cargo`) | `npm` |
-| `manifest` | Path to manifest file | Auto-detected |
-| `fail-on-missing` | Fail build if packages not in archive | `false` |
-| `api-url` | Prechained API URL | `https://prechained.com/.netlify/functions/api` |
+| `ecosystem` | Ecosystem (currently `npm`) | `npm` |
+| `manifest` | Path to lockfile | auto-detected |
+| `fail-on-mismatch` | Fail build on tamper | `true` |
+| `fail-on-missing` | Fail build if not yet archived | `false` |
+| `api-url` | Prechained API URL | prechained.com |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `verified-count` | Number of packages found in archive |
-| `missing-count` | Number of packages not yet archived |
-| `report` | JSON verification report |
+| `verified-count` | Hashes matching the anchored record |
+| `mismatch-count` | Tamper detected |
+| `missing-count` | Not yet in archive |
+| `report` | Full JSON report |
 
-## What this proves
+## What a failure proves
 
-When a supply chain attack is disclosed, Prechained receipts prove your CI/CD was pulling from clean, pre-attack package versions. Every verified package has a SHA-384 fingerprint and Bitcoin block height anchoring it in time.
+A `mismatch` means the artifact your build resolved is **not** the artifact
+Prechained recorded and anchored to Bitcoin at the captured timestamp. Either
+the package was republished/altered, or your resolution was redirected. Both are
+supply-chain events worth stopping a build for.
 
-- **prechained.com** — Browse the archive
-- **prechained.com/capture** — Capture any package on-demand
-- **prechained.com/verify** — Verify a receipt ID
-- **prechained.com/incidents** — Incidents where Prechained had pre-disclosure records
+- **prechained.com** — browse the archive
+- **prechained.com/capture** — capture any package on-demand
+- **prechained.com/verify** — verify a receipt ID
+- **prechained.com/incidents** — incidents with pre-disclosure records
 
 Built by [NextGenRails™](https://nextgenrails.net) · AGPL-3.0
