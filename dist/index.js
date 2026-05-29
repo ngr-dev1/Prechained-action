@@ -53,6 +53,37 @@ async function fetchJSON(url) {
   }
 }
 
+// Fire a capture request for a package not yet in the archive.
+// Fire-and-forget: we don't block the build on it. The package becomes
+// verifiable on a FUTURE run once the archive has recorded it.
+function requestCapture(captureUrl, ecosystem, pkg) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({ package: pkg.name, ecosystem, version: pkg.version });
+    const u = new URL(captureUrl);
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'http:' ? 80 : 443),
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'User-Agent': 'prechained-action',
+      },
+      timeout: 10000,
+    }, (res) => {
+      // Drain and resolve regardless of status — 429 (rate limit) is expected
+      // and not an error from the build's perspective.
+      res.on('data', () => {});
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 // -- Lockfile parsing -------------------------------------------
 // Returns [{ name, version, integrity, shasum }] for what will ACTUALLY install.
 
@@ -172,6 +203,11 @@ async function run() {
   const failOnMismatch = (getInput('fail-on-mismatch') || 'true') === 'true';
   const failOnMissing  = (getInput('fail-on-missing')  || 'false') === 'true';
   const apiUrl = getInput('api-url') || 'https://prechained.com/.netlify/functions/api';
+  const captureUrl = getInput('capture-url') || 'https://prechained.com/.netlify/functions/capture';
+  const captureOnMiss = (getInput('capture-on-miss') || 'true') === 'true';
+  // The capture endpoint is rate-limited (10/hour/IP). Cap how many we fire per
+  // run so a large dependency tree doesn't blow the limit and get throttled.
+  const maxCaptures = parseInt(getInput('max-captures') || '8', 10);
 
   log(`Tamper-checking ${ecosystem} dependencies against the Prechained archive`);
 
@@ -238,9 +274,28 @@ async function run() {
   }
 
   if (results.missing.length) {
-    console.log('\n📦 Not in archive yet (capture at prechained.com/capture):');
+    console.log('\n📦 Not in archive yet:');
     results.missing.slice(0, 10).forEach(p => console.log(`   • ${p.name}@${p.version}`));
     if (results.missing.length > 10) console.log(`   ... and ${results.missing.length - 10} more`);
+
+    // Capture-on-miss: teach the archive what real projects depend on.
+    // Fire-and-forget, capped to respect the endpoint's rate limit. These
+    // packages become verifiable on a FUTURE run, not this one.
+    if (captureOnMiss && maxCaptures > 0) {
+      const toCapture = results.missing.slice(0, maxCaptures);
+      console.log(`\n📡 Requesting capture for ${toCapture.length} package(s) so they're verifiable next run...`);
+      let requested = 0, throttled = 0;
+      for (const p of toCapture) {
+        const status = await requestCapture(captureUrl, ecosystem, p);
+        if (status === 429) throttled++;
+        else if (status && status < 500) requested++;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      console.log(`   ${requested} capture(s) requested${throttled ? `, ${throttled} rate-limited (will retry on a later run)` : ''}.`);
+      if (results.missing.length > maxCaptures) {
+        console.log(`   ${results.missing.length - maxCaptures} more not requested this run (rate-limit cap). Future runs will pick them up.`);
+      }
+    }
   }
 
   // Honest coverage signal: a green check means little if most of the tree
