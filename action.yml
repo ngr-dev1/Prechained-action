@@ -1,5 +1,5 @@
 name: 'Prechained Supply Chain Verify'
-description: 'Verify your dependencies against the Prechained cryptographic archive. Detects supply chain attacks before they reach production.'
+description: 'Detect tampered dependencies by comparing your lockfile hashes against the Bitcoin-anchored Prechained archive. Fails the build on mismatch.'
 author: 'NextGenRails™'
 
 branding:
@@ -8,15 +8,19 @@ branding:
 
 inputs:
   ecosystem:
-    description: 'Package ecosystem to verify (npm, pypi, cargo)'
+    description: 'Package ecosystem. Tamper detection currently supports: npm'
     required: false
     default: 'npm'
   manifest:
-    description: 'Path to manifest file (package.json, requirements.txt, Cargo.toml)'
+    description: 'Path to the lockfile (package-lock.json). Auto-detected if omitted.'
     required: false
     default: ''
+  fail-on-mismatch:
+    description: 'Fail the build if any artifact hash does not match the anchored record (tamper). Default true — this is the point of the gate.'
+    required: false
+    default: 'true'
   fail-on-missing:
-    description: 'Fail the build if packages are not in the Prechained archive'
+    description: 'Also fail if a package is not yet in the archive. Default false.'
     required: false
     default: 'false'
   api-url:
@@ -26,11 +30,13 @@ inputs:
 
 outputs:
   verified-count:
-    description: 'Number of packages verified in the archive'
+    description: 'Packages whose hash matches the Bitcoin-anchored record'
+  mismatch-count:
+    description: 'Packages whose hash does NOT match (tamper detected)'
   missing-count:
-    description: 'Number of packages not yet in the archive'
+    description: 'Packages not yet in the archive'
   report:
-    description: 'JSON report of verification results'
+    description: 'Full JSON verification report'
 
 runs:
   using: 'node24'
